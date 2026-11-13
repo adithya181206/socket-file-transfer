@@ -1,6 +1,6 @@
 # Socket File Transfer System
 
-> A production-grade TCP/IP socket file transfer system featuring multi-threaded client concurrency, custom 4-byte length-prefixed binary protocol framing, and end-to-end SHA-256 data integrity verification engineered in pure Python 3.
+> A production-grade TCP/IP socket file transfer system featuring multi-threaded server concurrency, custom length-prefixed protocol framing, and end-to-end SHA-256 data integrity verification engineered in pure Python 3.
 
 [![Python](https://img.shields.io/badge/Python-3.9%2B-3776AB?style=for-the-badge&logo=python&logoColor=white)](https://www.python.org/)
 [![Dependencies](https://img.shields.io/badge/Dependencies-Zero%20Mandatory-success?style=for-the-badge)](requirements.txt)
@@ -10,17 +10,17 @@
 
 ## Overview & Key Engineering Highlights
 
-This project implements a high-performance, resilient client–server file transfer suite built directly on raw TCP streams using Python's standard library. Designed to demonstrate systems-level network engineering concepts, it handles simultaneous bidirectional file transfers across independent worker threads with explicit packet boundary framing, automatic collision resolution, and cryptographic verification.
+This project implements a high-performance, resilient client–server file transfer system built directly on raw TCP streams using Python's standard library. Designed to demonstrate systems-level network engineering concepts, it handles simultaneous bidirectional file transfers across independent worker threads with explicit message boundary framing, automatic collision resolution, and cryptographic verification.
 
-- **Raw TCP Stream Handling**: Implements direct stream socket operations (`socket.AF_INET`, `socket.SOCK_STREAM`) with manual 1024-byte chunk buffering (`CHUNK_SIZE = 1024`) and byte-exact buffer reassembly (`_recv_exact()`), bypassing high-level HTTP/FTP abstractions.
-- **Multi-Threaded Server Concurrency (`threading.Thread` & `threading.Lock`)**: Spawns an isolated daemon worker thread per incoming client connection (`threading.Thread(target=handle_client, daemon=True)`). Active client tracking, server start timestamps, and runtime statistics are coordinated using a synchronized `threading.Lock`.
-- **4-Byte Big-Endian Length-Prefixed Framing**: Solves TCP message boundary ambiguity ("sticky packets" and chunk fragmentation) at the application layer by prepending every JSON control message with a 4-byte big-endian unsigned integer (`struct.pack('>I', len)`).
-- **End-to-End Cryptographic Integrity**: Computes SHA-256 checksums in streaming, memory-efficient blocks (`hashlib.sha256`) on the client prior to sending and on the server after receipt, detecting transmission corruption with zero buffer exhaustion.
+- **Raw TCP Stream Handling**: Direct stream socket management (`socket.AF_INET`, `socket.SOCK_STREAM`) with 1024-byte chunk buffering (`CHUNK_SIZE = 1024`) and byte-exact buffer reassembly (`_recv_exact()`), bypassing high-level HTTP/FTP abstraction layers.
+- **Multi-Threaded Server Concurrency (`threading.Thread` & `threading.Lock`)**: Non-blocking client lifecycle management using dedicated worker threads (`threading.Thread(target=handle_client, daemon=True)`) per incoming connection. Active client registries and runtime server telemetry are synchronized with a mutex lock (`threading.Lock`).
+- **4-Byte Big-Endian Length-Prefixed JSON Framing**: Solves TCP stream framing boundaries and "sticky packet" fragmentation at the application layer by prepending every JSON control message with a 4-byte big-endian unsigned length integer (`struct.pack('>I', len)` / `struct.calcsize('>I') = 4`).
+- **End-to-End Cryptographic Integrity (SHA-256)**: Incremental streaming SHA-256 hashing (`hashlib.sha256`) computed over 1024-byte chunks on both client and server, validating byte parity and detecting bit rot or packet truncation without loading entire files into memory.
 - **Defensive Edge-Case Engineering**:
-  - **Path Traversal Protection**: `sanitize_filename()` strips directory paths, replaces directory separators (`/`, `\\`), and rejects relative parent lookups (`..`).
-  - **Duplicate Handling**: Server automatically detects existing files and appends collision suffixes (`file_1.ext`, `file_2.ext`) instead of overwriting data.
-  - **Aborted Transfer Recovery**: Interrupted transfers automatically trigger clean-up that renames incomplete writes to `.partial` files.
-  - **Port Reuse**: Configured with `socket.SO_REUSEADDR` to avoid lingering `TIME_WAIT` lockups and provide actionable startup diagnostics.
+  - `sanitize_filename()`: Strips directory path components (`os.path.basename`), normalizes directory separators (`/`, `\\`), and rejects path traversal sequences (`..`).
+  - `.partial` Recovery: Aborted or interrupted connections automatically trigger exception recovery that isolates incomplete writes as `<filename>.partial` files, preventing repository corruption.
+  - Automatic Collision Resolution: Detects existing filenames in destination folders and increments suffixes (`filename_1.ext`, `filename_2.ext`) instead of silently overwriting data.
+  - `socket.SO_REUSEADDR`: Listening socket enables immediate port rebinding on restart by bypassing lingering `TIME_WAIT` states, accompanied by graceful `OSError` error handling when ports conflict.
 
 ---
 
@@ -28,7 +28,7 @@ This project implements a high-performance, resilient client–server file trans
 
 ### Concurrency Model
 
-```
+```text
 ┌─────────────────────────────────────────────────────────────────────────┐
 │                         SINGLE MACHINE (localhost)                      │
 │                                                                         │
@@ -50,31 +50,32 @@ This project implements a high-performance, resilient client–server file trans
 
 ### Custom Wire Protocol Specification
 
-Every control message in the application layer uses **length-prefixed framing**:
+Every control exchange in the application layer uses **4-byte big-endian length-prefixed JSON framing**, followed by continuous raw binary file chunks during data transfer:
 
-```
-[ 4-byte big-endian integer (length) ] [ UTF-8 JSON payload of exact length ]
+```text
+[ 4-byte big-endian length header ] [ UTF-8 encoded JSON control payload ]
+[ 1024-byte raw binary file chunks (streamed sequentially until EOF)      ]
 ```
 
-- **Header**: 4 bytes, `>I` format (`struct.pack('>I', len(encoded))`).
-- **Control Payload**: Valid JSON dictionary specifying commands, statuses, filenames, or checksums.
+- **Header Format**: 4 bytes, `>I` format (`struct.pack('>I', len(encoded))`).
+- **Control Payload**: Serialized UTF-8 JSON dictionary specifying commands, statuses, filenames, or checksums.
 - **Binary Data Stream**: Raw byte stream transferred in discrete 1024-byte blocks (`CHUNK_SIZE`) immediately following the metadata handshake.
 
 ### Command Table
 
 | Command | Direction | Purpose | Payload Details |
 | :--- | :--- | :--- | :--- |
-| `UPLOAD` | Client → Server | Initiates a file upload | `{"command": "UPLOAD"}` |
-| `DOWNLOAD` | Client → Server | Requests a file download | `{"command": "DOWNLOAD", "filename": "<name>"}` |
-| `LIST` | Client → Server | Queries server file inventory | `{"command": "LIST"}` |
-| `STATUS` | Client → Server | Queries server telemetry/health | `{"command": "STATUS"}` |
-| `EXIT` | Client → Server | Gracefully terminates session | `{"command": "EXIT"}` |
+| `UPLOAD` | Client → Server | Initiates a file upload workflow | `{"command": "UPLOAD"}` |
+| `DOWNLOAD` | Client → Server | Requests a file download from server | `{"command": "DOWNLOAD", "filename": "<name>"}` |
+| `LIST` | Client → Server | Queries server repository file inventory | `{"command": "LIST"}` |
+| `STATUS` | Client → Server | Queries server telemetry, uptime & health | `{"command": "STATUS"}` |
+| `EXIT` | Client → Server | Gracefully terminates client session | `{"command": "EXIT"}` |
 
 ### Step-by-Step Handshake Sequences
 
 #### Upload Handshake Sequence
 
-```
+```text
 Client                                                  Server
   │                                                        │
   ├─────── [4B Header] {"command": "UPLOAD"} ─────────────►│
@@ -91,14 +92,14 @@ Client                                                  Server
 
 1. **Initiation**: Client transmits `{"command": "UPLOAD"}`.
 2. **Metadata Request**: Server replies with `{"status": "READY_FOR_METADATA"}`.
-3. **Metadata Transmission**: Client sends target filename, size in bytes, and pre-computed SHA-256 checksum.
-4. **Validation**: Server sanitizes filename, prevents path traversal, resolves collisions, and replies with `{"status": "READY"}`.
-5. **Data Streaming**: Client streams the file in 1024-byte chunks with real-time progress updates.
+3. **Metadata Transmission**: Client computes SHA-256 and sends target filename, size in bytes, and checksum.
+4. **Validation**: Server sanitizes filename, checks disk space, resolves collisions, and replies with `{"status": "READY"}`.
+5. **Data Streaming**: Client streams the file in 1024-byte chunks with real-time terminal progress updates.
 6. **Integrity Check**: Server calculates SHA-256 over received bytes and confirms `{"status": "UPLOAD_SUCCESS"}` or flags `{"status": "CHECKSUM_MISMATCH"}`.
 
 #### Download Handshake Sequence
 
-```
+```text
 Client                                                  Server
   │                                                        │
   ├─────── [4B Header] {"command": "DOWNLOAD", filename} ─►│ (Inspects received_files/)
@@ -113,7 +114,7 @@ Client                                                  Server
 
 1. **Request**: Client queries `{"command": "DOWNLOAD", "filename": "<filename>"}`.
 2. **Lookup**: Server validates file presence. If missing, responds with `{"status": "NOT_FOUND"}`; if present, responds with `{"status": "FOUND", "filesize": N, "checksum": "<sha256>"}`.
-3. **Ready Signal**: Client checks local storage path (auto-renaming if conflict exists) and returns `{"status": "READY"}`.
+3. **Ready Signal**: Client prepares local storage path (auto-renaming if conflict exists) and returns `{"status": "READY"}`.
 4. **Data Streaming**: Server transmits raw binary chunks to the client socket.
 5. **Verification**: Client calculates local SHA-256 digest upon transfer completion and verifies byte parity against server metadata.
 
@@ -121,7 +122,7 @@ Client                                                  Server
 
 ## Sample Terminal Output (Demo)
 
-### Interactive Client Menu & Upload Session
+### Interactive Client Menu & Upload Trace
 
 ```text
 ==================================================
@@ -145,20 +146,20 @@ Server Port [default: 5000]:
 Choose an option [1-5]: 1
 Enter path to file to upload: ../test-files/test1.txt
 [*] Computing SHA-256 checksum of 'test1.txt' ...
-[*] Checksum: a5600c32b508f7dd...  Size: 22 B
+[*] Checksum: affad7b90643abc5...  Size: 23 B
 
 [*] Uploading 'test1.txt' ...
-Uploading: [=============================>] 100.0%  22 B/22 B  2.4 KB/s   
+Uploading: [=============================>] 100.0%  23 B/23 B  2.4 KB/s   
 
 [✓] Upload successful!
     File stored as : test1.txt
-    Bytes          : 22
+    Bytes          : 23
     Elapsed        : 0.01 s
     Speed          : 0.15 MB/s
     Integrity      : SHA-256 verified ✓
 ```
 
-### File Listing & Download Session
+### File Listing & Download Trace
 
 ```text
 Choose an option [1-5]: 2
@@ -167,24 +168,24 @@ Choose an option [1-5]: 2
 #     Filename                            Size  Modified
 ──────────────────────────────────────────────────────────────────────
 1     largefile.bin                    5.00 MB  2026-09-26 10:54:12
-2     test1.txt                           22 B  2026-09-26 10:15:30
+2     test1.txt                           23 B  2026-11-13 12:44:10
 3     test2.txt                        3.24 KB  2026-09-26 10:15:44
 
 Enter filename to download (exact name): test1.txt
 
-[*] File found: 'test1.txt'  Size: 22 B
+[*] File found: 'test1.txt'  Size: 23 B
 [*] Downloading 'test1.txt' ...
-Downloading: [=============================>] 100.0%  22 B/22 B  3.1 KB/s   
+Downloading: [=============================>] 100.0%  23 B/23 B  3.1 KB/s   
 
 [✓] Download successful!
     Saved to   : C:\Users\...\client\downloaded_files\test1.txt
-    Bytes      : 22
+    Bytes      : 23
     Elapsed    : 0.01 s
     Speed      : 0.18 MB/s
     Integrity  : SHA-256 verified ✓
 ```
 
-### Server Telemetry Output
+### Server Telemetry Trace
 
 ```text
 Choose an option [1-5]: 4
@@ -192,7 +193,7 @@ Choose an option [1-5]: 4
 ╔══════════════════════════════════════╗
 ║          SERVER STATUS               ║
 ╠══════════════════════════════════════╣
-║  Host          : 0.0.0.0             ║
+║  Host          : 127.0.0.1           ║
 ║  Port          : 5000                ║
 ║  Uptime        : 00h 14m 32s         ║
 ║  Active clients: 1                   ║
@@ -208,31 +209,32 @@ Choose an option [1-5]: 4
 socket-file-transfer/
 ├── client/
 │   ├── downloaded_files/       # Storage directory for retrieved files
-│   ├── files_to_send/          # Local files prepared for dispatch (test1.txt, test2.txt)
-│   └── client.py               # Interactive CLI client implementation
-├── dashboard/                  # Optional web monitoring dashboard (Flask)
-│   ├── app.py                  # Dashboard application backend
-│   ├── check_syntax.py         # Syntax verification script
-│   └── patch_html.py           # Dashboard UI styling patcher
-├── logs/                       # Automated application runtime logs
+│   └── client.py               # Interactive CLI client with progress display
+├── dashboard/                  # Optional web telemetry dashboard (Flask)
+│   ├── app.py                  # Web dashboard application backend
+│   ├── check_syntax.py         # Diagnostic syntax verification
+│   └── patch_html.py           # Dashboard interface patcher
+├── logs/                       # Application runtime event logs
 │   ├── client.log              # Client-side execution and error records
 │   └── server.log              # Server-side connection and transfer logs
 ├── server/
-│   ├── received_files/         # Storage repository for incoming uploaded files
-│   ├── file_meta.json          # Server metadata registry for tracking
+│   ├── received_files/         # Repository for incoming uploaded files
+│   ├── file_meta.json          # Server metadata tracking registry
 │   └── server.py               # Multi-threaded TCP socket server
 ├── shared/
 │   └── protocol.py             # Protocol framing, network constants, and utility helpers
 ├── test-files/
-│   ├── generate_large_file.py  # Utility generator for 5 MB pseudo-random binary files
-│   ├── test1.txt               # Lightweight text test fixture (22 B)
+│   ├── generate_large_file.py  # Utility generator for 5 MB binary benchmark files
+│   ├── largefile.bin           # 5 MB pseudo-random test fixture
+│   ├── test1.txt               # Lightweight text test fixture (23 B)
 │   └── test2.txt               # Medium text test fixture (~3.3 KB)
-├── .gitignore                  # Git tracking exclusion configuration
+├── .gitignore                  # Git repository exclusion rules
 ├── demo_run.py                 # Automated end-to-end operation demonstration script
+├── LICENSE                     # MIT open-source license
 ├── README.md                   # System documentation and protocol specification
 ├── requirements.txt            # Project dependencies (zero mandatory dependencies)
 ├── run_client.bat / .sh        # Convenience launch scripts for client
-├── run_dashboard.bat / .sh     # Convenience launch scripts for dashboard
+├── run_dashboard.bat / .sh     # Convenience launch scripts for web dashboard
 ├── run_server.bat / .sh        # Convenience launch scripts for server
 └── test_e2e.py                 # Automated integration test script
 ```
@@ -261,7 +263,7 @@ git clone https://github.com/adithya181206/socket-file-transfer.git
 cd socket-file-transfer
 ```
 
-### Step 2: Start Server & Client Instances
+### Step 2: Running Server & Multiple Concurrent Clients
 
 #### Option A: One-Click Launch Scripts
 
@@ -301,9 +303,9 @@ python client.py
 # (On Linux / macOS: python3 client.py)
 ```
 
-*Note: When prompted for Server IP and Port, press `Enter` to use default values (`127.0.0.1:5000`).*
+*Note: When prompted for Server IP and Port, press `Enter` to use default values (`127.0.0.1:5000`). To test concurrency, open multiple client terminal windows simultaneously.*
 
-### Step 3: Generate the 5 MB Benchmark Test File
+### Step 3: Generating the 5 MB Benchmark Test File
 
 ```bash
 cd test-files
@@ -311,7 +313,7 @@ python generate_large_file.py
 # (On Linux / macOS: python3 generate_large_file.py)
 ```
 
-This generates `test-files/largefile.bin` containing 5 MB of cryptographically uncompressible bytes (`os.urandom`) written in 1 MB chunks to benchmark raw socket throughput.
+This generates `test-files/largefile.bin` containing 5 MB of cryptographically uncompressible bytes (`os.urandom`) written in 1 MB blocks to benchmark raw socket throughput.
 
 ---
 
@@ -338,7 +340,7 @@ Verify thread safety, socket isolation, and server stability under concurrent wo
 
 | # | Test Scenario | Execution Step | Expected Behavior |
 | :---: | :--- | :--- | :--- |
-| **1** | **Small File Upload** | Upload `test-files/test1.txt` (22 B) | Server acknowledges payload; SHA-256 confirmed instantly. |
+| **1** | **Small File Upload** | Upload `test-files/test1.txt` (23 B) | Server acknowledges payload; SHA-256 confirmed instantly. |
 | **2** | **Download Parity** | Download `test1.txt` back to client | File placed in `client/downloaded_files/`; digests match. |
 | **3** | **Medium File Transfer** | Upload and download `test-files/test2.txt` (~3.3 KB) | Multi-chunk stream verifies smoothly across chunk boundaries. |
 | **4** | **Large File Benchmark** | Transfer `test-files/largefile.bin` (5 MB) | Progress meter tracks in real time; memory stays flat. |
@@ -361,7 +363,7 @@ Verify thread safety, socket isolation, and server stability under concurrent wo
 | :--- | :--- |
 | **TCP Stream Boundaries** | Implemented 4-byte big-endian prefix framing (`struct.pack('>I', len)`), allowing the socket receiver to read the exact payload length without relying on delimiters. |
 | **Client Concurrency** | Configured `threading.Thread(target=handle_client, daemon=True)` for non-blocking per-connection lifecycles, keeping the main `accept()` loop free. |
-| **State Thread-Safety** | Enforced mutex synchronization (`threading.Lock`) over client connection registries and file-access tracking. |
+| **State Thread-Safety** | Enforced mutex synchronization (`threading.Lock`) over client connection registries and runtime server telemetry. |
 | **Payload Integrity** | Streaming SHA-256 hashing (`hashlib.sha256`) computed incrementally in 1024-byte chunks on both sender and receiver. |
 | **Path Traversal Attacks** | Implemented `sanitize_filename()` to strip directory trees (`os.path.basename`), replace separators (`/`, `\\`), and disallow relative parent paths (`..`). |
 | **Silent Data Overwrites** | Automatic duplicate resolution appends incrementing integer suffixes (`<name>_1.<ext>`) to preserve existing files. |
@@ -388,7 +390,7 @@ All runtime events are tracked in the `logs/` directory using standardized times
 | **02** | **Resumable Transfers** | Implement byte-offset negotiation (`Range` headers) to resume interrupted `.partial` transfers from last received chunk. |
 | **03** | **Streaming Compression** | Integrate inline `zlib` stream compression/decompression to maximize transfer speeds across bandwidth-constrained networks. |
 | **04** | **Token Authentication** | Implement challenge-response handshakes with token validation before granting access to server commands. |
-| **05** | **Web Telemetry Dashboard** | Expand the included Flask dashboard (`dashboard/app.py`) with real-time WebSocket telemetry, transfer charts, and browser uploads. |
+| **05** | **Flask Status Dashboard** | Expand the included Flask dashboard (`dashboard/app.py`) with real-time WebSocket telemetry, transfer charts, and browser uploads. |
 
 ---
 
