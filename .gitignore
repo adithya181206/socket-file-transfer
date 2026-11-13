@@ -18,3 +18,4 @@ client/downloaded_files/*
 # Generated stress-test files & partial recovery files
 test-files/largefile.bin
 *.partial
+
